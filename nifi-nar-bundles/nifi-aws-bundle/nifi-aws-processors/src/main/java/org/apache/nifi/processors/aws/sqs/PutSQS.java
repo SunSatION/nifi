@@ -24,7 +24,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.nifi.annotation.behavior.DynamicProperty;
@@ -36,6 +35,8 @@ import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.ValidationContext;
+import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
@@ -57,17 +58,38 @@ import com.amazonaws.services.sqs.model.SendMessageBatchRequestEntry;
 public class PutSQS extends AbstractSQSProcessor {
 
     public static final PropertyDescriptor DELAY = new PropertyDescriptor.Builder()
-            .name("Delay")
+            .name("delay")
+            .displayName("Delay")
             .description("The amount of time to delay the message before it becomes available to consumers")
-            .required(true)
+            .required(false)
             .addValidator(StandardValidators.TIME_PERIOD_VALIDATOR)
-            .defaultValue("0 secs")
+            .build();
+
+    public static final PropertyDescriptor MESSAGE_GROUP_ID = new PropertyDescriptor.Builder()
+            .name("message-group-id")
+            .displayName("Message Group ID")
+            .description("You must provide a non-empty MessageGroupId when sending messages to a FIFO queue")
+            .required(false)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .defaultValue(null)
+            .expressionLanguageSupported(true)
             .build();
 
     public static final List<PropertyDescriptor> properties = Collections.unmodifiableList(
-            Arrays.asList(QUEUE_URL, ACCESS_KEY, SECRET_KEY, CREDENTIALS_FILE, AWS_CREDENTIALS_PROVIDER_SERVICE, REGION, DELAY, TIMEOUT, PROXY_HOST, PROXY_HOST_PORT));
+            Arrays.asList(QUEUE_URL, ACCESS_KEY, SECRET_KEY, CREDENTIALS_FILE, AWS_CREDENTIALS_PROVIDER_SERVICE, REGION, DELAY, TIMEOUT, PROXY_HOST, PROXY_HOST_PORT, MESSAGE_GROUP_ID));
 
     private volatile List<PropertyDescriptor> userDefinedProperties = Collections.emptyList();
+
+    @Override
+    protected Collection<ValidationResult> customValidate(ValidationContext context) {
+        final List<ValidationResult> problems = new ArrayList<>(super.customValidate(context));
+        final boolean delaySet = context.getProperty(DELAY).isSet();
+        final boolean messageGroupId = context.getProperty(MESSAGE_GROUP_ID).isSet();
+
+        if ( delaySet && messageGroupId )
+            problems.add(new ValidationResult.Builder().subject("Combined Message Group Id / Delay").input("Message Group ID & Delay").valid(false).explanation("Message Group Id and Delay cannot be both set simultaneously").build());
+        return problems;
+    }
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
@@ -127,24 +149,36 @@ public class PutSQS extends AbstractSQSProcessor {
         }
 
         entry.setMessageAttributes(messageAttributes);
-        entry.setDelaySeconds(context.getProperty(DELAY).asTimePeriod(TimeUnit.SECONDS).intValue());
+        if ( context.getProperty(MESSAGE_GROUP_ID).isSet() )
+            entry.setMessageGroupId(context.getProperty(MESSAGE_GROUP_ID).evaluateAttributeExpressions(flowFile).getValue());
+        if ( context.getProperty(DELAY).isSet()  )
+            entry.setDelaySeconds(context.getProperty(DELAY).asTimePeriod(TimeUnit.SECONDS).intValue());
+
         entries.add(entry);
 
         request.setEntries(entries);
 
+        Exception error =null;
         try {
-            client.sendMessageBatch(request);
+            SendMessageBatchResult x = client.sendMessageBatch(request);
         } catch (final Exception e) {
-            getLogger().error("Failed to send messages to Amazon SQS due to {}; routing to failure", new Object[]{e});
+            error = e;
+        }
+
+        if ( error != null )
+        {
+            Map<String, String> attributes = new HashMap<>();
+            attributes.put("sqs.error", error.getMessage().toString());
+            flowFile = session.putAllAttributes(flowFile, attributes);
+            getLogger().error("Failed to send messages to Amazon SQS due to {}; routing to failure", new Object[]{error});
             flowFile = session.penalize(flowFile);
             session.transfer(flowFile, REL_FAILURE);
             return;
+        } else {
+            getLogger().info("Successfully published message to Amazon SQS for {}", new Object[]{flowFile});
+            session.transfer(flowFile, REL_SUCCESS);
+            final long transmissionMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+            session.getProvenanceReporter().send(flowFile, queueUrl, transmissionMillis);
         }
-
-        getLogger().info("Successfully published message to Amazon SQS for {}", new Object[]{flowFile});
-        session.transfer(flowFile, REL_SUCCESS);
-        final long transmissionMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
-        session.getProvenanceReporter().send(flowFile, queueUrl, transmissionMillis);
     }
-
 }
